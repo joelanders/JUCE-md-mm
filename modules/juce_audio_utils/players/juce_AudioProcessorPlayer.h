@@ -26,6 +26,16 @@
 namespace juce
 {
 
+namespace detail
+{
+/** Preserves inactive-channel null sentinels while splitting an audio callback. */
+template <typename Pointer>
+Pointer addAudioCallbackChannelOffset (Pointer channel, int offset) noexcept
+{
+    return channel != nullptr ? channel + offset : nullptr;
+}
+}
+
 //==============================================================================
 /**
     An AudioIODeviceCallback object which streams audio through an AudioProcessor.

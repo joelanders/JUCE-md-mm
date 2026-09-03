@@ -73,12 +73,33 @@ static void initialiseIoBuffers (ChannelInfo<const float> ins,
     size_t totalNumChans = 0;
     const auto numBytes = (size_t) numSamples * sizeof (float);
 
+    const auto getInputChannel = [&] (int index) -> const float*
+    {
+        if (ins.data == nullptr || ins.numChannels == 0)
+            return nullptr;
+
+        return ins.data[index % ins.numChannels];
+    };
+
+    const auto prepareOutputChannel = [&] (int index)
+    {
+        auto* output = outs.data != nullptr && index < outs.numChannels
+                         ? outs.data[index]
+                         : nullptr;
+
+        // Inactive/sparse device channels are allowed to be nullptr. Give the
+        // processor a private discard channel instead of exposing a null pointer.
+        channels[totalNumChans] = output != nullptr
+                                    ? output
+                                    : tempBuffer.getWritePointer ((int) totalNumChans);
+    };
+
     const auto prepareInputChannel = [&] (int index)
     {
-        if (ins.numChannels == 0)
-            zeromem (channels[totalNumChans], numBytes);
+        if (const auto* input = getInputChannel (index))
+            memcpy (channels[totalNumChans], input, numBytes);
         else
-            memcpy (channels[totalNumChans], ins.data[index % ins.numChannels], numBytes);
+            zeromem (channels[totalNumChans], numBytes);
     };
 
     if (processorIns > processorOuts)
@@ -91,14 +112,14 @@ static void initialiseIoBuffers (ChannelInfo<const float> ins,
 
         for (int i = 0; i < processorOuts; ++i)
         {
-            channels[totalNumChans] = outs.data[i];
+            prepareOutputChannel (i);
             prepareInputChannel (i);
             ++totalNumChans;
         }
 
         for (auto i = processorOuts; i < processorIns; ++i)
         {
-            channels[totalNumChans] = tempBuffer.getWritePointer (i - processorOuts);
+            channels[totalNumChans] = tempBuffer.getWritePointer ((int) totalNumChans);
             prepareInputChannel (i);
             ++totalNumChans;
         }
@@ -107,14 +128,14 @@ static void initialiseIoBuffers (ChannelInfo<const float> ins,
     {
         for (int i = 0; i < processorIns; ++i)
         {
-            channels[totalNumChans] = outs.data[i];
+            prepareOutputChannel (i);
             prepareInputChannel (i);
             ++totalNumChans;
         }
 
         for (auto i = processorIns; i < processorOuts; ++i)
         {
-            channels[totalNumChans] = outs.data[i];
+            prepareOutputChannel (i);
             zeromem (channels[totalNumChans], (size_t) numSamples * sizeof (float));
             ++totalNumChans;
         }
@@ -356,8 +377,9 @@ void AudioProcessorPlayer::audioDeviceIOCallbackWithContext (const float* const*
         }
     }
 
-    for (int i = 0; i < numOutputChannels; ++i)
-        FloatVectorOperations::clear (outputChannelData[i], numSamples);
+    for (int i = 0; outputChannelData != nullptr && i < numOutputChannels; ++i)
+        if (outputChannelData[i] != nullptr)
+            FloatVectorOperations::clear (outputChannelData[i], numSamples);
 }
 
 void AudioProcessorPlayer::audioDeviceAboutToStart (AudioIODevice* const device)
@@ -480,6 +502,30 @@ struct AudioProcessorPlayerTests final : public UnitTest
                     }
                 }
             }
+        }
+
+        beginTest ("Sparse system channels use silence/discard buffers");
+        {
+            constexpr int numSamples = 32;
+            auto systemIns = getTestBuffer (2, numSamples);
+            auto systemOuts = getTestBuffer (2, numSamples);
+            const float* sparseIns[] { nullptr, systemIns.getReadPointer (1) };
+            float* sparseOuts[] { systemOuts.getWritePointer (0), nullptr };
+            AudioBuffer<float> tempBuffer (4, numSamples);
+            std::vector<float*> channels (4, nullptr);
+
+            initialiseIoBuffers ({ sparseIns, 2 }, { sparseOuts, 2 }, numSamples,
+                                 4, 2, tempBuffer, channels);
+
+            expect (std::all_of (channels.begin(), channels.end(),
+                                 [] (const auto* ptr) { return ptr != nullptr; }));
+            expect (channels[0] != channels[1]);
+            expect (channels[1] != channels[2]);
+            expect (channels[2] != channels[3]);
+            expect (FloatVectorOperations::findMinAndMax (channels[0], numSamples)
+                    == Range<float> (0.0f, 0.0f));
+            expect (FloatVectorOperations::findMinAndMax (channels[1], numSamples)
+                    == Range<float> (2.0f, 2.0f));
         }
     }
 

@@ -105,8 +105,11 @@ public:
 
     void init (bool enableAudioInput, const String& preferredDefaultDeviceName)
     {
-        setupAudioDevices (enableAudioInput, preferredDefaultDeviceName, options.get());
+        // Restore the processor while no audio callback exists. Some processors
+        // construct a complete replacement engine in setStateInformation(); opening
+        // CoreAudio first makes that cold-start work race an uninitialised player.
         reloadPluginState();
+        setupAudioDevices (enableAudioInput, preferredDefaultDeviceName, options.get());
         startPlaying();
 
        if (autoOpenMidiDevices)
@@ -461,7 +464,9 @@ private:
 
         void audioDeviceAboutToStart (AudioIODevice* device) override
         {
-            maximumSize = device->getCurrentBufferSizeSamples();
+            // A device transition may briefly report no preferred block size.
+            // Keep the splitter progressing even on that defensive edge case.
+            maximumSize = jmax (1, device->getCurrentBufferSizeSamples());
             storedInputChannels .resize ((size_t) device->getActiveInputChannels() .countNumberOfSetBits());
             storedOutputChannels.resize ((size_t) device->getActiveOutputChannels().countNumberOfSetBits());
 
@@ -509,12 +514,25 @@ private:
             int offset;
 
             template <typename Ptr>
-            auto operator() (Ptr ptr) const noexcept -> Ptr { return ptr + offset; }
+            auto operator() (Ptr ptr) const noexcept -> Ptr
+            {
+                // AudioIODeviceCallback explicitly permits inactive physical
+                // channels to be represented by nullptr entries. Preserve that
+                // sentinel when splitting oversized callbacks; adding a non-zero
+                // offset to nullptr manufactures a small, invalid address.
+                return detail::addAudioCallbackChannelOffset (ptr, offset);
+            }
         };
 
         template <typename Ptr, typename Vector>
         void initChannelPointers (Ptr&& source, Vector&& target, int offset)
         {
+            if (source == nullptr)
+            {
+                std::fill (target.begin(), target.end(), nullptr);
+                return;
+            }
+
             std::transform (source, source + target.size(), target.begin(), GetChannelWithOffset { offset });
         }
 
