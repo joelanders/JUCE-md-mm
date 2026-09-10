@@ -108,11 +108,13 @@ public:
         // Restore the processor while no audio callback exists. Some processors
         // construct a complete replacement engine in setStateInformation(); opening
         // CoreAudio first makes that cold-start work race an uninitialised player.
+        startupAudioInputEnabled = enableAudioInput;
+        startupPreferredDefaultDeviceName = preferredDefaultDeviceName;
         reloadPluginState();
         setupAudioDevices (enableAudioInput, preferredDefaultDeviceName, options.get());
         startPlaying();
 
-       if (autoOpenMidiDevices)
+       if (autoOpenMidiDevices || audioStartupRetryPending)
            startTimer (500);
     }
 
@@ -310,7 +312,15 @@ public:
         {
             auto xml = deviceManager.createStateXml();
 
-            settings->setValue ("audioSetup", xml.get());
+            // An output-only startup fallback is temporary. Keep the user's
+            // full-duplex setup so the next launch will try it again. If they
+            // re-enable an input in the settings dialog, preserve that choice.
+            auto* device = deviceManager.getCurrentAudioDevice();
+            const auto hasActiveInput = device != nullptr
+                                     && ! device->getActiveInputChannels().isZero();
+
+            if (! usedOutputOnlyStartupFallback || hasActiveInput)
+                settings->setValue ("audioSetup", xml.get());
 
            #if ! (JUCE_IOS || JUCE_ANDROID)
             settings->setValue ("shouldMuteInput", (bool) shouldMuteInput.getValue());
@@ -342,12 +352,76 @@ public:
             outputChannels = 1;
         }
 
-        deviceManager.initialise (enableAudioInput ? inputChannels : 0,
-                                  outputChannels,
-                                  savedState.get(),
-                                  true,
-                                  preferredDefaultDeviceName,
-                                  preferredSetupOptions);
+        usedOutputOnlyStartupFallback = false;
+        const auto requestedInputChannels = enableAudioInput ? inputChannels : 0;
+        const auto initialError = deviceManager.initialise (requestedInputChannels,
+                                                            outputChannels,
+                                                            savedState.get(),
+                                                            true,
+                                                            preferredDefaultDeviceName,
+                                                            preferredSetupOptions);
+
+        auto* initialDevice = deviceManager.getCurrentAudioDevice();
+        const auto initialDeviceRunning = initialDevice != nullptr
+                                       && initialDevice->isPlaying();
+        String fallbackError;
+        const auto fallbackAttempted = requestedInputChannels > 0
+                                    && outputChannels > 0
+                                    && (initialError.isNotEmpty()
+                                        || ! initialDeviceRunning);
+
+        if (fallbackAttempted)
+        {
+            // A synth can still run and explain the unavailable input when the
+            // default output opens. Don't reuse the failed saved setup here: it
+            // may name the input device that prevented the full-duplex open.
+            deviceManager.closeAudioDevice();
+            for (auto* type : deviceManager.getAvailableDeviceTypes())
+                type->scanForDevices();
+            fallbackError = deviceManager.initialise (0, outputChannels, nullptr,
+                                                      false, {}, nullptr);
+            auto* fallbackDevice = deviceManager.getCurrentAudioDevice();
+            usedOutputOnlyStartupFallback = fallbackError.isEmpty()
+                                         && fallbackDevice != nullptr
+                                         && fallbackDevice->isPlaying();
+            if (! usedOutputOnlyStartupFallback && fallbackError.isEmpty())
+                fallbackError = "No audio output device is available.";
+        }
+
+        auto* runningDevice = deviceManager.getCurrentAudioDevice();
+        audioStartupRetryPending = runningDevice == nullptr
+                                || ! runningDevice->isPlaying();
+
+        if (settings != nullptr)
+        {
+            auto* device = deviceManager.getCurrentAudioDevice();
+            if (audioStartupRetryCount == 0)
+            {
+                settings->setValue ("standaloneAudioFirstInitialError", initialError);
+                settings->setValue ("standaloneAudioFirstFallbackError", fallbackError);
+            }
+            settings->setValue ("standaloneAudioInitialError", initialError);
+            settings->setValue ("standaloneAudioFallbackAttempted", fallbackAttempted);
+            settings->setValue ("standaloneAudioFallbackError", fallbackError);
+            settings->setValue ("standaloneAudioUsedOutputOnlyFallback",
+                                usedOutputOnlyStartupFallback);
+            settings->setValue ("standaloneAudioDevice",
+                                device != nullptr ? device->getName() : String());
+            settings->setValue ("standaloneAudioDevicePlaying",
+                                device != nullptr && device->isPlaying());
+            settings->setValue ("standaloneAudioRetryCount", audioStartupRetryCount);
+
+            if (auto* file = dynamic_cast<PropertiesFile*> (settings.get()))
+                file->saveIfNeeded();
+        }
+
+        Logger::writeToLog ("Standalone audio startup: inputs="
+                            + String (requestedInputChannels)
+                            + " outputs=" + String (outputChannels)
+                            + " initialError=\"" + initialError
+                            + "\" fallbackAttempted=" + String ((int) fallbackAttempted)
+                            + " fallbackError=\"" + fallbackError
+                            + "\" outputOnly=" + String ((int) usedOutputOnlyStartupFallback));
     }
 
     //==============================================================================
@@ -418,6 +492,11 @@ public:
     Value shouldMuteInput;
     AudioBuffer<float> emptyBuffer;
     bool autoOpenMidiDevices;
+    bool usedOutputOnlyStartupFallback = false;
+    bool startupAudioInputEnabled = false;
+    bool audioStartupRetryPending = false;
+    int audioStartupRetryCount = 0;
+    String startupPreferredDefaultDeviceName;
 
     std::unique_ptr<AudioDeviceManager::AudioDeviceSetup> options;
     Array<MidiDeviceInfo> lastMidiDevices;
@@ -696,6 +775,24 @@ private:
 
     void timerCallback() override
     {
+        if (audioStartupRetryPending)
+        {
+            if (audioStartupRetryCount < 10)
+            {
+                ++audioStartupRetryCount;
+                reloadAudioDeviceState (startupAudioInputEnabled,
+                                        startupPreferredDefaultDeviceName,
+                                        options.get());
+            }
+            else
+            {
+                audioStartupRetryPending = false;
+            }
+
+            if (! audioStartupRetryPending && ! autoOpenMidiDevices)
+                stopTimer();
+        }
+
         auto newMidiDevices = MidiInput::getAvailableDevices();
 
         if (newMidiDevices != lastMidiDevices)
