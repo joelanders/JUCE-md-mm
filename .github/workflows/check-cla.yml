@@ -2,6 +2,7 @@ name: check-CLA
 on: [pull_request_target]
 jobs:
   check-cla:
+    if: github.repository == 'juce-framework/JUCE'
     runs-on: ubuntu-latest
     env:
       PR_NUMBER: ${{ github.event.number }}
