@@ -29,6 +29,14 @@
  #include <juce_audio_plugin_client/detail/juce_CreatePluginFilter.h>
 #endif
 
+// Plug-ins with an optional input may want the standalone application to start
+// with output only. The input remains available in the audio-device settings,
+// and an explicitly saved input selection is still restored by the device
+// manager.
+#ifndef JUCE_STANDALONE_PLUGIN_AUTO_OPEN_AUDIO_INPUT
+ #define JUCE_STANDALONE_PLUGIN_AUTO_OPEN_AUDIO_INPUT 1
+#endif
+
 namespace juce
 {
 
@@ -93,7 +101,9 @@ public:
         if (preferredSetupOptions != nullptr)
             options.reset (new AudioDeviceManager::AudioDeviceSetup (*preferredSetupOptions));
 
-        auto audioInputRequired = (inChannels > 0);
+        const auto inputWasExplicitlyEnabled = settings != nullptr
+                                            && settings->getBoolValue ("standaloneAudioInputExplicitlyEnabled", false);
+        auto audioInputRequired = shouldAutoOpenAudioInput (inChannels, inputWasExplicitlyEnabled);
 
         if (audioInputRequired && RuntimePermissions::isRequired (RuntimePermissions::recordAudio)
             && ! RuntimePermissions::isGranted (RuntimePermissions::recordAudio))
@@ -153,6 +163,27 @@ public:
 
         return (channelConfiguration.size() > 0 ? channelConfiguration[0].numOuts
                                                 : processor->getMainBusNumOutputChannels());
+    }
+
+    static constexpr bool shouldAutoOpenAudioInput (int availableInputChannels,
+                                                    bool inputWasExplicitlyEnabled = false) noexcept
+    {
+        return availableInputChannels > 0
+            && (JUCE_STANDALONE_PLUGIN_AUTO_OPEN_AUDIO_INPUT != 0
+                || inputWasExplicitlyEnabled);
+    }
+
+    static void disableAudioInputInSavedState (XmlElement& state)
+    {
+        auto outputName = state.getStringAttribute ("audioOutputDeviceName");
+
+        if (outputName.isEmpty())
+            outputName = state.getStringAttribute ("audioDeviceName");
+
+        state.removeAttribute ("audioDeviceName");
+        state.setAttribute ("audioInputDeviceName", String());
+        state.setAttribute ("audioOutputDeviceName", outputName);
+        state.setAttribute ("audioDeviceInChans", "0");
     }
 
     static String getFilePatterns (const String& fileSuffix)
@@ -319,6 +350,11 @@ public:
             const auto hasActiveInput = device != nullptr
                                      && ! device->getActiveInputChannels().isZero();
 
+           #if ! JUCE_STANDALONE_PLUGIN_AUTO_OPEN_AUDIO_INPUT
+            if (device != nullptr && ! usedOutputOnlyStartupFallback)
+                settings->setValue ("standaloneAudioInputExplicitlyEnabled", hasActiveInput);
+           #endif
+
             if (! usedOutputOnlyStartupFallback || hasActiveInput)
                 settings->setValue ("audioSetup", xml.get());
 
@@ -342,6 +378,9 @@ public:
             shouldMuteInput.setValue (settings->getBoolValue ("shouldMuteInput", true));
            #endif
         }
+
+        if (! enableAudioInput && savedState != nullptr)
+            disableAudioInputInSavedState (*savedState);
 
         auto inputChannels  = getNumInputChannels();
         auto outputChannels = getNumOutputChannels();
