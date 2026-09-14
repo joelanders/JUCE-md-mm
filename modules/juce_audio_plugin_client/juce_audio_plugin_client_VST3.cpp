@@ -79,6 +79,15 @@ JUCE_BEGIN_NO_SANITIZE ("vptr")
  #endif
 #endif
 
+#ifndef JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS
+ // Opt in for instruments whose MIDI programs are independent of host presets.
+ #define JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS 0
+#endif
+
+#if JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS && ! JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS
+ #error "MIDI program units require MIDI controller parameter emulation"
+#endif
+
 #if JUCE_LINUX || JUCE_BSD
  #include <juce_events/native/juce_EventLoopInternal_linux.h>
  #include <unordered_map>
@@ -426,7 +435,7 @@ public:
     //==============================================================================
     Steinberg::int32 PLUGIN_API getUnitCount() override
     {
-        return parameterGroups.size() + 1;
+        return parameterGroups.size() + 1 + numMidiProgramUnits;
     }
 
     tresult PLUGIN_API getUnitInfo (Steinberg::int32 unitIndex, Vst::UnitInfo& info) override
@@ -435,7 +444,7 @@ public:
         {
             info.id             = Vst::kRootUnitId;
             info.parentUnitId   = Vst::kNoParentUnitId;
-            info.programListId  = getProgramListCount() > 0
+            info.programListId  = audioProcessor->getNumPrograms() > 0
                                 ? static_cast<Vst::ProgramListID> (programParamID)
                                 : Vst::kNoProgramListId;
 
@@ -444,8 +453,19 @@ public:
             return kResultTrue;
         }
 
-        if (auto* group = parameterGroups[unitIndex - 1])
+        const auto midiChannel = unitIndex - parameterGroups.size() - 1;
+        if (isPositiveAndBelow (midiChannel, numMidiProgramUnits))
         {
+            info.id            = getMidiProgramUnitID (midiChannel);
+            info.parentUnitId  = Vst::kRootUnitId;
+            info.programListId = midiProgramListID;
+            toString128 (info.name, "MIDI Channel " + String (midiChannel + 1));
+            return kResultTrue;
+        }
+
+        if (isPositiveAndBelow (unitIndex - 1, parameterGroups.size()))
+        {
+            const auto* group = parameterGroups[unitIndex - 1];
             info.id             = JuceAudioProcessor::getUnitID (group);
             info.parentUnitId   = JuceAudioProcessor::getUnitID (group->getParent());
             info.programListId  = Vst::kNoProgramListId;
@@ -460,15 +480,20 @@ public:
 
     Steinberg::int32 PLUGIN_API getProgramListCount() override
     {
-        if (audioProcessor->getNumPrograms() > 0)
-            return 1;
-
-        return 0;
+        return (audioProcessor->getNumPrograms() > 0 ? 1 : 0) + (numMidiProgramUnits > 0 ? 1 : 0);
     }
 
     tresult PLUGIN_API getProgramListInfo (Steinberg::int32 listIndex, Vst::ProgramListInfo& info) override
     {
-        if (listIndex == 0)
+        if (numMidiProgramUnits > 0 && listIndex == (audioProcessor->getNumPrograms() > 0 ? 1 : 0))
+        {
+            info.id = midiProgramListID;
+            info.programCount = 128;
+            toString128 (info.name, "MIDI Programs");
+            return kResultTrue;
+        }
+
+        if (listIndex == 0 && audioProcessor->getNumPrograms() > 0)
         {
             info.id = static_cast<Vst::ProgramListID> (programParamID);
             info.programCount = static_cast<Steinberg::int32> (audioProcessor->getNumPrograms());
@@ -485,6 +510,12 @@ public:
 
     tresult PLUGIN_API getProgramName (Vst::ProgramListID listId, Steinberg::int32 programIndex, Vst::String128 name) override
     {
+        if (numMidiProgramUnits > 0 && listId == midiProgramListID && isPositiveAndBelow (programIndex, 128))
+        {
+            toString128 (name, "Program " + String (programIndex + 1));
+            return kResultTrue;
+        }
+
         if (listId == static_cast<Vst::ProgramListID> (programParamID)
             && isPositiveAndBelow ((int) programIndex, audioProcessor->getNumPrograms()))
         {
@@ -504,11 +535,40 @@ public:
     tresult PLUGIN_API setUnitProgramData (Steinberg::int32, Steinberg::int32, IBStream*) override                              { return kNotImplemented; }
     Vst::UnitID PLUGIN_API getSelectedUnit() override                                                                           { return Vst::kRootUnitId; }
 
-    tresult PLUGIN_API getUnitByBus (Vst::MediaType, Vst::BusDirection, Steinberg::int32, Steinberg::int32, Vst::UnitID& unitId) override
+    tresult PLUGIN_API getUnitByBus ([[maybe_unused]] Vst::MediaType type,
+                                    [[maybe_unused]] Vst::BusDirection direction,
+                                    [[maybe_unused]] Steinberg::int32 bus,
+                                    [[maybe_unused]] Steinberg::int32 channel, Vst::UnitID& unitId) override
     {
+       #if JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS
+        if (type != Vst::kEvent || direction != Vst::kInput || bus != 0 || ! isPositiveAndBelow (channel, 16))
+            return kResultFalse;
+
+        unitId = getMidiProgramUnitID (channel);
+       #else
         unitId = Vst::kRootUnitId;
+       #endif
         return kResultOk;
     }
+
+    Vst::UnitID getMidiProgramUnitID (int channel) const noexcept
+    {
+        // Avoid collisions with user-defined parameter-group hashes, without
+        // changing any existing group IDs or MIDI parameter IDs.
+        Vst::UnitID candidate = 0x6d706300;
+        for (int i = 0; i <= channel; ++candidate)
+        {
+            const auto used = std::any_of (parameterGroups.begin(), parameterGroups.end(),
+                                          [candidate] (const auto* group) { return getUnitID (group) == candidate; });
+            if (! used && i++ == channel)
+                return candidate;
+        }
+        jassertfalse;
+        return Vst::kRootUnitId;
+    }
+
+    static constexpr int numMidiProgramUnits = JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS ? 16 : 0;
+    static constexpr Vst::ProgramListID midiProgramListID = 0x6d706367;
 
     //==============================================================================
     inline Vst::ParamID getVSTParamIDForIndex (int paramIndex) const noexcept
@@ -1109,11 +1169,16 @@ public:
                                                     [[maybe_unused]] Vst::ParamID& resultID) override
     {
        #if JUCE_VST3_EMULATE_MIDI_CC_WITH_PARAMETERS
+        if (busIndex != 0 || ! isPositiveAndBelow ((int) channel, numMIDIChannels))
+            return kResultFalse;
+
         if (midiControllerNumber == Vst::kCtrlProgramChange)
         {
             resultID = static_cast<Vst::ParamID> (numMidiCCParams + channel) + parameterToMidiControllerOffset;
             return kResultTrue;
         }
+        if (! isPositiveAndBelow ((int) midiControllerNumber, (int) Vst::kCountCtrlNumber))
+            return kResultFalse;
         resultID = midiControllerToParameter[channel][midiControllerNumber];
         return kResultTrue; // Returning false makes some hosts stop asking for further MIDI Controller Assignments
        #else
@@ -1641,8 +1706,13 @@ private:
             parameterToMidiController[p].ctrlNumber = Vst::kCtrlProgramChange;
 
             parameters.addParameter (new Vst::Parameter (toString ("MIDI PC " + String (c)),
+                                    #if JUCE_VST3_EMULATE_MIDI_PC_WITH_PROGRAMS
+                                     static_cast<Vst::ParamID> (p) + parameterToMidiControllerOffset, nullptr, 0, 127,
+                                     Vst::ParameterInfo::kIsProgramChange, audioProcessor->getMidiProgramUnitID (c)));
+                                    #else
                                      static_cast<Vst::ParamID> (p) + parameterToMidiControllerOffset, nullptr, 0, 0,
                                      0, Vst::kRootUnitId));
+                                    #endif
         }
     }
 
