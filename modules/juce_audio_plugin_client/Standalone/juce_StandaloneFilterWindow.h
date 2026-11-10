@@ -29,6 +29,8 @@
  #include <juce_audio_plugin_client/detail/juce_CreatePluginFilter.h>
 #endif
 
+#include <juce_audio_plugin_client/Standalone/juce_StandaloneOptionsMenuHandler.h>
+
 // Plug-ins with an optional input may want the standalone application to start
 // with output only. The input remains available in the audio-device settings,
 // and an explicitly saved input selection is still restored by the device
@@ -1038,6 +1040,15 @@ private:
 
     void buttonClicked (Button*) override
     {
+        if (auto* editor = getAudioProcessor()->getActiveEditor())
+        {
+            if (auto* handler = dynamic_cast<StandaloneOptionsMenuHandler*> (editor))
+            {
+                handler->showStandaloneOptionsMenu();
+                return;
+            }
+        }
+
         PopupMenu m;
         m.addItem (1, TRANS ("Audio/MIDI Settings..."));
         m.addSeparator();

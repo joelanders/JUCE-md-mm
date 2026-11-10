@@ -1980,7 +1980,7 @@ private:
             }
 
             lastReportedSize.reset();
-            rect = convertFromHostBounds (*newSize);
+            rect = roundToViewRect (convertFromHostBounds (*newSize));
 
             if (component == nullptr)
                 return kResultTrue;
@@ -2015,7 +2015,7 @@ private:
             const auto editorBounds = component->getSizeToContainChild();
             const auto sizeToReport = lastReportedSize.has_value()
                                     ? *lastReportedSize
-                                    : convertToHostBounds ({ 0, 0, editorBounds.getWidth(), editorBounds.getHeight() });
+                                    : convertToHostBounds (editorBounds.withZeroOrigin().toFloat());
 
             lastReportedSize = *size = sizeToReport;
             return kResultTrue;
@@ -2045,18 +2045,15 @@ private:
                         auto constrainedRect = component->getLocalArea (editor, editor->getLocalBounds())
                                                         .getSmallestIntegerContainer();
 
-                        *rectToCheck = convertFromHostBounds (*rectToCheck);
+                        *rectToCheck = roundToViewRect (convertFromHostBounds (*rectToCheck));
                         rectToCheck->right  = rectToCheck->left + roundToInt (constrainedRect.getWidth());
                         rectToCheck->bottom = rectToCheck->top  + roundToInt (constrainedRect.getHeight());
-                        *rectToCheck = convertToHostBounds (*rectToCheck);
+                        *rectToCheck = convertToHostBounds (createRectangle (*rectToCheck));
                     }
                     else if (auto* constrainer = editor->getConstrainer())
                     {
-                        *rectToCheck = convertFromHostBounds (*rectToCheck);
-
-                        auto editorBounds = editor->getLocalArea (component.get(),
-                                                                  Rectangle<int>::leftTopRightBottom (rectToCheck->left, rectToCheck->top,
-                                                                                                      rectToCheck->right, rectToCheck->bottom).toFloat());
+                        const auto clientBounds = convertFromHostBounds (*rectToCheck);
+                        const auto editorBounds = editor->getLocalArea (component.get(), clientBounds);
 
                         auto minW = (float) constrainer->getMinimumWidth();
                         auto maxW = (float) constrainer->getMaximumWidth();
@@ -2070,17 +2067,22 @@ private:
 
                         if (! approximatelyEqual (aspectRatio, 0.0f))
                         {
+                            // Deciding this from the proposed ratio alone always corrects the larger of
+                            // the two dimensions, so the result can only ever be smaller than what the
+                            // host asked for. Dragging a single edge proposes a change in one dimension
+                            // only, and that is precisely the dimension that gets discarded: dragging an
+                            // edge outwards does nothing, dragging it inwards shrinks the editor, and
+                            // once the minimum is reached it cannot be made bigger again. Preferring the
+                            // dimension that actually changed avoids this. Dragging a corner changes both
+                            // dimensions and still falls back to the ratio.
+                            auto currentEditorBounds = editor->getBounds().toFloat();
+
                             bool adjustWidth = (width / height > aspectRatio);
 
-                            if (detail::PluginUtilities::getHostType().type == PluginHostType::SteinbergCubase9)
-                            {
-                                auto currentEditorBounds = editor->getBounds().toFloat();
-
-                                if (approximatelyEqual (currentEditorBounds.getWidth(), width) && ! approximatelyEqual (currentEditorBounds.getHeight(), height))
-                                    adjustWidth = true;
-                                else if (approximatelyEqual (currentEditorBounds.getHeight(), height) && ! approximatelyEqual (currentEditorBounds.getWidth(), width))
-                                    adjustWidth = false;
-                            }
+                            if (approximatelyEqual (currentEditorBounds.getWidth(), width) && ! approximatelyEqual (currentEditorBounds.getHeight(), height))
+                                adjustWidth = true;
+                            else if (approximatelyEqual (currentEditorBounds.getHeight(), height) && ! approximatelyEqual (currentEditorBounds.getWidth(), width))
+                                adjustWidth = false;
 
                             if (adjustWidth)
                             {
@@ -2104,13 +2106,10 @@ private:
                             }
                         }
 
-                        auto constrainedRect = component->getLocalArea (editor, Rectangle<float> (width, height))
-                                                  .getSmallestIntegerContainer();
+                        auto constrainedRect = component->getLocalArea (editor, Rectangle<float> (width, height));
 
-                        rectToCheck->right  = rectToCheck->left + roundToInt (constrainedRect.getWidth());
-                        rectToCheck->bottom = rectToCheck->top  + roundToInt (constrainedRect.getHeight());
-
-                        *rectToCheck = convertToHostBounds (*rectToCheck);
+                        *rectToCheck = convertToHostBounds (clientBounds.withWidth (constrainedRect.getWidth())
+                                                                        .withHeight (constrainedRect.getHeight()));
                     }
                 }
 
@@ -2201,30 +2200,37 @@ private:
             onSize (&viewRect);
         }
 
-        static ViewRect convertToHostBounds (ViewRect pluginRect)
+        static ViewRect roundToViewRect (Rectangle<float> r)
         {
-            auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
-
-            if (approximatelyEqual (desktopScale, 1.0f))
-                return pluginRect;
-
-            return { roundToInt ((float) pluginRect.left   * desktopScale),
-                     roundToInt ((float) pluginRect.top    * desktopScale),
-                     roundToInt ((float) pluginRect.right  * desktopScale),
-                     roundToInt ((float) pluginRect.bottom * desktopScale) };
+            const auto rounded = r.toNearestIntEdges();
+            return { rounded.getX(),
+                     rounded.getY(),
+                     rounded.getRight(),
+                     rounded.getBottom() };
         }
 
-        static ViewRect convertFromHostBounds (ViewRect hostRect)
+        static Rectangle<float> createRectangle (ViewRect viewRect)
         {
-            auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
+            return Rectangle<float>::leftTopRightBottom ((float) viewRect.left,
+                                                         (float) viewRect.top,
+                                                         (float) viewRect.right,
+                                                         (float) viewRect.bottom);
+        }
 
-            if (approximatelyEqual (desktopScale, 1.0f))
-                return hostRect;
+        static ViewRect convertToHostBounds (Rectangle<float> pluginRect)
+        {
+            const auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
+            return roundToViewRect (approximatelyEqual (desktopScale, 1.0f) ? pluginRect
+                                                                            : pluginRect * desktopScale);
+        }
 
-            return { roundToInt ((float) hostRect.left   / desktopScale),
-                     roundToInt ((float) hostRect.top    / desktopScale),
-                     roundToInt ((float) hostRect.right  / desktopScale),
-                     roundToInt ((float) hostRect.bottom / desktopScale) };
+        static Rectangle<float> convertFromHostBounds (ViewRect hostViewRect)
+        {
+            const auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
+            const auto hostRect = createRectangle (hostViewRect);
+
+            return approximatelyEqual (desktopScale, 1.0f) ? hostRect
+                                                           : (hostRect / desktopScale);
         }
 
         //==============================================================================
@@ -2332,7 +2338,7 @@ private:
 
                         {
                             const ScopedValueSetter<bool> resizingChildSetter (resizingChild, true);
-                            pluginEditor->setBounds (pluginEditor->getLocalArea (this, newBounds).withPosition (0, 0));
+                            pluginEditor->setBounds (pluginEditor->getLocalArea (this, newBounds).withZeroOrigin());
                         }
 
                         lastBounds = newBounds;
@@ -2356,7 +2362,7 @@ private:
                     if (owner.plugFrame != nullptr)
                     {
                         auto editorBounds = getSizeToContainChild();
-                        auto newSize = convertToHostBounds ({ 0, 0, editorBounds.getWidth(), editorBounds.getHeight() });
+                        auto newSize = convertToHostBounds (editorBounds.withZeroOrigin().toFloat());
 
                         {
                             const ScopedValueSetter<bool> resizingParentSetter (resizingParent, true);
@@ -2370,7 +2376,7 @@ private:
                        #else
                         if (host.isWavelab() || host.isAbletonLive() || host.isBitwigStudio() || owner.owner->blueCatPatchwork)
                        #endif
-                            setBounds (editorBounds.withPosition (0, 0));
+                            setBounds (editorBounds.withZeroOrigin());
                     }
                 }
             }
@@ -2385,7 +2391,7 @@ private:
                         const ScopedValueSetter<bool> resizingChildSetter (resizingChild, true);
 
                         pluginEditor->setScaleFactor (scale);
-                        pluginEditor->setBounds (prevEditorBounds.withPosition (0, 0));
+                        pluginEditor->setBounds (prevEditorBounds.withZeroOrigin());
                     }
 
                     lastBounds = getSizeToContainChild();

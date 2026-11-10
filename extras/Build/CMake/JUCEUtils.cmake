@@ -762,17 +762,21 @@ function(_juce_add_resources_rc source_target dest_target)
         get_target_property(input_info_file ${source_target} JUCE_INFO_FILE)
 
         get_target_property(generated_icon ${source_target} JUCE_ICON_FILE)
-        set(dependency)
+
+        # The info file is what the resource is made of, so it has to be a dependency of it.
+        # Without it the .rc is generated once and never again, and a build tree that is not
+        # wiped goes on stamping the version that was current when it was created.
+        set(dependencies "${input_info_file}")
 
         if(generated_icon)
-            set(dependency DEPENDS "${generated_icon}")
+            list(APPEND dependencies "${generated_icon}")
         endif()
 
         set(resource_rc_file "${juce_library_code}/${source_target}_resources.rc")
 
         add_custom_command(OUTPUT "${resource_rc_file}"
             COMMAND juce::juceaide rcfile "${input_info_file}" "${resource_rc_file}"
-            ${dependency}
+            DEPENDS ${dependencies}
             VERBATIM)
 
         add_library(${source_target}_rc_lib OBJECT ${resource_rc_file})
@@ -818,6 +822,11 @@ function(_juce_create_windows_package source_target dest_target extension defaul
 
     set(is_x64 $<EQUAL:${CMAKE_SIZEOF_VOID_P},8>)
     set(arch_string $<IF:${is_x64},${x64folder},${x32folder}>)
+
+    # optional seventh argument: the folder of an ARM64 build, hosts do not look for one in the x64 folder
+    if(ARGC GREATER 6 AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+        set(arch_string ${ARGV6})
+    endif()
 
     set_target_properties(${dest_target}
         PROPERTIES
@@ -1101,7 +1110,7 @@ function(_juce_set_plugin_target_properties shared_code_target kind)
             XCODE_ATTRIBUTE_LIBRARY_STYLE Bundle
             XCODE_ATTRIBUTE_GENERATE_PKGINFO_FILE YES)
 
-        _juce_create_windows_package(${shared_code_target} ${target_name} vst3 "" x86-win x86_64-win)
+        _juce_create_windows_package(${shared_code_target} ${target_name} vst3 "" x86-win x86_64-win arm64-win)
 
         set(output_path "${products_folder}/${product_name}.vst3")
 
